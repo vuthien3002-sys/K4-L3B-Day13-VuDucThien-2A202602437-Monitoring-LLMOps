@@ -129,4 +129,4 @@
 - [x] Trace/prompt evidence thuộc project Langfuse cá nhân và ảnh không lộ key/secret.
 - [x] Repository chạy lại được theo README.
 - [x] Không có secret, API key, PII thô hoặc evidence của người khác/lớp khác (`.env`, `data/logs.jsonl`, `config/challenge.json` không được commit).
-- [ ] URL repo và commit SHA cuối đã được nộp trên LMS/Codelabs.
+- [x] URL repo và commit SHA cuối đã được nộp trên LMS/Codelabs.
