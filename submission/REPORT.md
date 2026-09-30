@@ -25,9 +25,9 @@
 | PII redaction | `evidence/05-pii-redaction.png` |
 | Trace list | `evidence/06-trace-list.png` |
 | Trace waterfall | `evidence/07-trace-waterfall.png` |
-| Trace metadata | `evidence/08-trace-metadata.png` |
+| Trace metadata | `evidence/08-trace-metadata.png`, `evidence/08b-generation-usage-cost.png` |
 | Prompt versions | `evidence/09-prompt-versions.png` |
-| Prompt rollback | `evidence/10-prompt-rollback.png` |
+| Prompt rollback | `evidence/10a-prompt-after-promote.png`, `evidence/10b-prompt-after-rollback.png` |
 | Dashboard runtime | `evidence/11-dashboard-overview.png` |
 | Incident metric | `evidence/12-incident-metric.png` |
 | Incident log | `evidence/13-incident-log.png` |
@@ -37,13 +37,13 @@
 
 | Nội dung | Baseline | Kết quả cuối | Nhận xét |
 |---|---|---|---|
-| `validate_logs.py` | 30/100 (thiếu correlation ID, thiếu enrichment) | | |
-| `validate_dashboard.py` | 6/6 panel hợp lệ | | |
-| `pytest` | 22 passed | | |
-| Số traces hợp lệ | 10 trace `lab-agent-run` (correlation_id=MISSING) | | |
-| Số PII leak | 0 | | |
-| Latency P95 / TTFT P95 | 1405 ms / 50 ms | | |
-| Retrieval success rate | 100% (10/10, không có lỗi) | | |
+| `validate_logs.py` | 30/100 (thiếu correlation ID, thiếu enrichment) | 100/100 (413 records, 196 correlation ID) | CP1: middleware + bind context + `scrub_event` |
+| `validate_dashboard.py` | 6/6 panel hợp lệ | 6/6 panel hợp lệ | Dashboard runtime: `scripts/dashboard.py` |
+| `pytest` | 22 passed | 36 passed | Thêm test PII, correlation ID, child observation, dashboard |
+| Số traces hợp lệ | 10 trace `lab-agent-run` (correlation_id=MISSING) | 60+ trace đủ cây `lab-agent-run` → `retrieval` + `generation` | Có `correlation_id`, prompt version, usage, cost |
+| Số PII leak | 0 | 0 | Validator + test với email/SĐT/CCCD/thẻ |
+| Latency P95 / TTFT P95 | 1405 ms / 50 ms | 3663 ms / 51 ms (cửa sổ 60 phút) | P95 vượt 3000 ms do mạng tới Langfuse chập chờn: TTFT không đổi, thời gian chậm nằm ở bước tải prompt (trace `9a6b3fb2…`: root bắt đầu 03:28:36, generation mới chạy 03:28:48) |
+| Retrieval success rate | 100% (10/10, không có lỗi) | 100% | Chưa bật incident |
 
 ## 4. Logging và PII
 
@@ -54,21 +54,30 @@
 
 ## 5. Tracing và prompt versioning
 
-- **Cách xác nhận traces do chính tôi tạo trong project cá nhân:**
-- **Cấu trúc root/retrieval/generation observations:**
-- **Cách nối trace với log:**
-- **Prompt name:**
-- **Version/label baseline:**
-- **Version/label candidate:**
-- **Trace ID của mỗi version:**
-- **Cách promote và rollback `production`:**
+- **Cách xác nhận traces do chính tôi tạo trong project cá nhân:** trace nằm trong project `day13-k4-l3b-2A202602437` (region EU), được gửi bằng key của chính project này trong `.env`; mỗi trace có `correlation_id` trùng với một dòng trong `data/logs.jsonl` do `scripts/load_test.py` chạy trên máy tôi tạo ra, và `session_id` khớp `data/sample_queries.jsonl` (`s01`…`s10`).
+- **Cấu trúc root/retrieval/generation observations:** trace `day13-agent-request` → root `lab-agent-run` (type `agent`, metadata prompt name/label/version, `correlation_id`) → hai child: `retrieval` (type `retriever`, `@observe` trên `retrieve()`, chỉ lưu `query_preview` đã scrub và `doc_count`) và `generation` (type `generation`, `@observe` trên `FakeLLM.generate()`, có `model`, `usage_details` input/output, `cost_details`, `completion_start_time` cho TTFT và prompt link qua `propagate_attributes(prompt=...)`). Không capture raw input/output (`capture_input=False, capture_output=False`).
+- **Cách nối trace với log:** middleware sinh `correlation_id` (`req-<8-hex>`), dùng cho cả structured log và metadata của trace (`propagate_attributes(metadata={"correlation_id": ...})`). Từ một log line lấy `correlation_id`, trên Langfuse lọc Metadata `correlation_id` để mở đúng trace.
+- **Prompt name:** `day13-chat` (text prompt, 3 biến `{{feature}}`, `{{docs}}`, `{{message}}`)
+- **Version/label baseline:** version 1, labels `baseline` + `production`
+- **Version/label candidate:** version 2 (thêm dòng "Answer concisely in at most 3 short bullet points."), label `candidate`
+- **Trace ID của mỗi version:** cùng input "Explain how monitoring metrics logs and traces work together"
+  - v1 / `baseline`: `ef0b3e5cf6f7b6162f67dd1584efbc0a` (`correlation_id=req-ba5e0009`, `prompt_version=1`, `tokens_in=44`)
+  - v2 / `candidate`: `0f77a248038ace6929e5e108cf9721b5` (`correlation_id=req-ca0d1d02`, `prompt_version=2`, `tokens_in=56`)
+  - Fake LLM trả cùng một câu trả lời nên hai version chỉ khác `prompt_version` và `tokens_in` (44 → 56 do v2 thêm một dòng hướng dẫn).
+- **Cách promote và rollback `production`:** app chỉ hỏi Langfuse prompt `day13-chat` theo label trong `LANGFUSE_PROMPT_LABEL`, nên đổi version không cần sửa code, chỉ dời label rồi restart API (prompt được cache 60 giây).
+  - Promote: gắn `production` cho v2 (label tự rời khỏi v1) → request kiểm tra `req-9a0de002`, trace `c731383f8d24a90dc59759f95abd23be`: `prompt_label=production`, `prompt_version=2`.
+  - Rollback: gắn lại `production` cho v1 (v2 chỉ còn `candidate`, `latest`) → request kiểm tra `req-b0bac001`, trace `64c0cbdc1183819593e78be863b23e3b`: `prompt_label=production`, `prompt_version=1`, `tokens_in=44`.
+  - Evidence: `evidence/10a-prompt-after-promote.png` (production ở v2) và `evidence/10b-prompt-after-rollback.png` (production về v1).
 
 ## 6. Dashboard, SLO và alerts
 
-- **Dashboard và sáu panel:**
-- **SLO và lý do chọn:**
-- **Cách tính error budget:**
-- **Ba alert và runbook tương ứng:**
+- **Dashboard và sáu panel:** `scripts/dashboard.py` đọc `data/logs.jsonl` và chính `config/dashboard.yaml` (tên panel, unit, threshold, time range 60 phút, refresh 30 giây), chạy bằng `python scripts/dashboard.py` → http://127.0.0.1:8050. Sáu panel: Latency (P50/P95/P99 + TTFT P95, threshold P95 ≤ 3000 ms), Traffic (request/phút, ≥ 1), Errors (error rate % ≤ 2, breakdown `error_type`, retrieval success % tính trên mọi event có `tool_success`), Cost (USD/phút + cumulative, total ≤ 2.5), Tokens (tokens_in/out theo phút + cumulative, ≤ 50,000), Quality (mean ≥ 0.75). Mỗi panel có badge OK/BREACH so với threshold.
+- **SLO và lý do chọn:** `fast_successful_requests`: 99.5% request có `response_sent` với `latency_ms ≤ 3000` trong 28 ngày. Baseline CP0 P95 = 1405 ms, nên ngưỡng 3000 ms còn khoảng 2 lần headroom, tránh báo động giả nhưng bắt được ngay khi một bước chậm thêm vài giây. Request lỗi không có `response_sent` nên cũng là bad event.
+- **Cách tính error budget:** `allowed_bad = floor(total × (100 − 99.5) / 100)`. 10,000 request → 50; traffic tối thiểu 1 request/phút trong 28 ngày = 40,320 request → 201; một buổi lab ~200 request → 1. Tiêu > 50% budget thì ưu tiên điều tra/rollback thay vì release mới.
+- **Ba alert và runbook tương ứng:** (`config/alert_rules.yaml`, runbook trong `docs/alerts.md`, Slack `#k4-l3b-alerts`, owner `student-2A202602437`)
+  1. `ChatLatencyP95High` (critical, 5m): P95 latency > 3000 ms → runbook `#alert-1`.
+  2. `ChatErrorRateHigh` (critical, 5m): error rate > 2% hoặc retrieval success < 90% → runbook `#alert-2`.
+  3. `ChatCostPerRequestSpike` (warning, 10m): cost trung bình > 0.004 USD/request (2× baseline) hoặc > 2.5 USD/24h → runbook `#alert-3`.
 
 > Ví dụ cách viết error budget: "SLO 99.5% trong 28 ngày nghĩa là error budget 0.5%. Nếu workload có 10,000 request thì tối đa 50 request được phép lỗi hoặc chậm hơn ngưỡng SLO."
 

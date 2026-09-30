@@ -7,7 +7,42 @@ primary_slo:
     total_event: 'event == "request_received"'
   target_percent: 99.5
   error_budget_percent: 0.5
-  note: Học viên phải giải thích hoặc điều chỉnh ngưỡng bằng baseline của mình. Ví dụ nếu có 10,000 request trong cửa sổ 28 ngày, error budget 0.5% nghĩa là tối đa 50 request được phép không đạt SLO.
+
+  # Baseline đo ở CP0 (10 request, data/logs.jsonl + GET /metrics), trước khi sửa code
+  baseline:
+    latency_p50_ms: 503
+    latency_p95_ms: 1405
+    ttft_p95_ms: 50
+    error_rate_pct: 0
+    retrieval_success_rate_pct: 100
+    quality_avg: 0.88
+
+  rationale: >
+    Giữ ngưỡng 3000 ms: baseline P95 = 1405 ms nên còn khoảng 2 lần headroom cho
+    dao động bình thường (lần gọi đầu tải prompt từ Langfuse, mạng chậm) mà không
+    báo động giả. Nếu một bước trong request chậm thêm vài giây (ví dụ retrieval
+    bị treo) thì request vượt 3000 ms và bị tính là bad event ngay. Request lỗi
+    không sinh response_sent nên cũng là bad event; SLI vì vậy đo cả "nhanh" lẫn
+    "thành công". Target 99.5% cho phép 0.5% request xấu, đủ chặt với một API
+    chat nhưng không đòi hỏi 100% với dependency ngoài (Langfuse, vector store).
+
+  error_budget:
+    formula: 'allowed_bad_requests = floor(total_requests * (100 - target_percent) / 100)'
+    examples:
+      - scenario: Ví dụ chuẩn của đề bài
+        total_requests: 10000
+        allowed_bad_requests: 50
+      - scenario: Traffic tối thiểu theo dashboard (1 request/phút trong 28 ngày = 40,320 request)
+        total_requests: 40320
+        allowed_bad_requests: 201
+      - scenario: Một buổi lab khoảng 200 request
+        total_requests: 200
+        allowed_bad_requests: 1
+    policy: >
+      Khi đã tiêu hơn 50% budget thì ưu tiên điều tra và rollback (prompt, cấu hình)
+      thay vì release thay đổi mới; tiêu hết budget thì dừng thay đổi cho tới khi
+      root cause được xử lý.
+
 guardrails:
   error_rate_pct_max: 2
   daily_cost_usd_max: 2.5
