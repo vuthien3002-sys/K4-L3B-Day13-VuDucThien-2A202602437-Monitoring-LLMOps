@@ -78,6 +78,24 @@ def test_dashboard_builds_six_panels_from_contract() -> None:
     assert _panel(data, "quality")["breached"] is False
 
 
+def test_dashboard_zoom_and_challenge_threshold() -> None:
+    config = load_dashboard_config(REPO_ROOT / "config" / "dashboard.yaml")
+    records = _ok(20, 100) + _ok(2, 2600) + _ok(1, 2700) + _ok(0, 150)
+    challenge = {"challenge_id": "demo", "latency_threshold_ms": 2000}
+
+    data = build_dashboard(records, config, NOW, window_minutes=10, challenge=challenge)
+
+    assert data["time_range_minutes"] == 10
+    assert data["contract_time_range_minutes"] == 60
+    assert len(data["labels"]) == 10
+    latency = _panel(data, "latency")
+    # Log 20 phút trước nằm ngoài cửa sổ phóng to 10 phút
+    assert latency["summary"]["challenge_total"] == 3
+    assert latency["summary"]["challenge_over_threshold"] == 2
+    # Threshold của contract (3000 ms) không bị thay đổi
+    assert latency["threshold"]["value"] == 3000
+
+
 def test_dashboard_renders_html_with_refresh() -> None:
     config = load_dashboard_config(REPO_ROOT / "config" / "dashboard.yaml")
     html = render_html(build_dashboard(_ok(0, 100), config, NOW))

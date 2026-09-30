@@ -17,17 +17,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from statistics import mean
 from typing import Any
+from urllib.parse import parse_qs
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from app.challenge import load_challenge
 from app.cli import configure_utf8_stdio
 from app.metrics import percentile
 from scripts.validate_dashboard import load_dashboard_config
 
 DEFAULT_CONFIG = REPO_ROOT / "config" / "dashboard.yaml"
 DEFAULT_LOGS = REPO_ROOT / "data" / "logs.jsonl"
+DEFAULT_CHALLENGE = REPO_ROOT / "config" / "challenge.json"
 
 
 def parse_ts(value: Any) -> datetime | None:
@@ -72,10 +75,20 @@ def _breached(value: Any, operator: str, limit: float) -> bool | None:
     return any(v < limit for v in values)
 
 
-def build_dashboard(records: list[dict], config: dict, now: datetime) -> dict:
-    """Tính 6 panel trong cửa sổ time_range_minutes, bucket theo phút (UTC)."""
+def build_dashboard(
+    records: list[dict],
+    config: dict,
+    now: datetime,
+    window_minutes: int | None = None,
+    challenge: dict | None = None,
+) -> dict:
+    """Tính 6 panel, bucket theo phút (UTC).
+
+    Mặc định dùng time_range_minutes của contract; window_minutes chỉ để phóng to khi
+    điều tra. challenge (nếu có) thêm đường ngưỡng latency riêng của challenge.
+    """
     dash = config["dashboard"]
-    window = int(dash["time_range_minutes"])
+    window = int(window_minutes or dash["time_range_minutes"])
     last_minute = now.astimezone(timezone.utc).replace(second=0, microsecond=0)
     minutes = [last_minute - timedelta(minutes=window - 1 - i) for i in range(window)]
     start = minutes[0]
@@ -187,9 +200,16 @@ def build_dashboard(records: list[dict], config: dict, now: datetime) -> dict:
             }
         )
 
+    if challenge:
+        limit = challenge["latency_threshold_ms"]
+        summaries["latency"]["challenge_over_threshold"] = sum(v > limit for v in lat)
+        summaries["latency"]["challenge_total"] = len(lat)
+
     return {
         "title": dash["title"],
         "time_range_minutes": window,
+        "contract_time_range_minutes": int(dash["time_range_minutes"]),
+        "challenge": challenge,
         "refresh_seconds": dash["refresh_seconds"],
         "generated_at": now.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "window_start": start.strftime("%H:%M UTC"),
@@ -257,7 +277,17 @@ const fmt = (v, d = 2) => v === null || v === undefined ? "–"
 
 document.getElementById("title").textContent = D.title;
 document.getElementById("range").textContent =
-  `last ${D.time_range_minutes} minutes (${D.window_start} – ${D.window_end})`;
+  `last ${D.time_range_minutes} minutes (${D.window_start} – ${D.window_end})` +
+  (D.time_range_minutes !== D.contract_time_range_minutes
+    ? ` · zoom (contract: ${D.contract_time_range_minutes} minutes)` : "");
+if (D.challenge) {
+  const el = document.createElement("div");
+  el.className = "meta";
+  el.innerHTML = "Challenge: <b></b>";
+  el.querySelector("b").textContent =
+    `${D.challenge.challenge_id} (threshold ${D.challenge.latency_threshold_ms} ms)`;
+  document.querySelector("header").appendChild(el);
+}
 document.getElementById("refresh").textContent = `${D.refresh_seconds}s`;
 document.getElementById("count").textContent = D.record_count;
 document.getElementById("generated").textContent = D.generated_at;
@@ -274,12 +304,18 @@ const limit = (p, axis = "y") =>
        { borderDash: [6, 4], pointRadius: 0, borderWidth: 1.5, yAxisID: axis });
 
 const PANELS = {
-  latency: p => ({
-    stats: { P50: p.summary.p50, P95: p.summary.p95, P99: p.summary.p99, "TTFT P95": p.summary.ttft_p95 },
-    datasets: [line("P50", S.latency_p50, "#98a2b3"), line("P95", S.latency_p95, "#2e6ef7"),
-               line("P99", S.latency_p99, "#7a5af8"), line("TTFT P95", S.ttft_p95, "#12b76a"), limit(p)],
-    y: { title: "ms" },
-  }),
+  latency: p => {
+    const stats = { P50: p.summary.p50, P95: p.summary.p95, P99: p.summary.p99, "TTFT P95": p.summary.ttft_p95 };
+    const datasets = [line("P50", S.latency_p50, "#98a2b3"), line("P95", S.latency_p95, "#2e6ef7"),
+                      line("P99", S.latency_p99, "#7a5af8"), line("TTFT P95", S.ttft_p95, "#12b76a"), limit(p)];
+    if (D.challenge) {
+      const c = D.challenge.latency_threshold_ms;
+      stats[`Challenge > ${c} ms`] = `${p.summary.challenge_over_threshold}/${p.summary.challenge_total}`;
+      datasets.push(line(`Challenge threshold ${c} ms`, D.labels.map(() => c), "#f79009",
+                         { borderDash: [2, 3], pointRadius: 0, borderWidth: 1.5 }));
+    }
+    return { stats, datasets, y: { title: "ms" } };
+  },
   traffic: p => ({
     stats: { "Total requests": p.summary.count, "Avg req/min": p.summary.rate_per_minute },
     datasets: [bar("Requests / minute", S.traffic, "#2e6ef7"), limit(p)],
@@ -381,24 +417,47 @@ def main() -> None:
     parser.add_argument("--logs", type=Path, default=DEFAULT_LOGS)
     parser.add_argument("--port", type=int, default=8050)
     parser.add_argument("--snapshot", type=Path, help="Ghi 1 file HTML tĩnh rồi thoát")
+    parser.add_argument("--minutes", type=int, help="Phóng to cửa sổ khi điều tra (mặc định theo contract)")
     args = parser.parse_args()
 
     config = load_dashboard_config(args.config)
+    contract_minutes = int(config["dashboard"]["time_range_minutes"])
 
-    def page() -> str:
-        return render_html(build_dashboard(load_records(args.logs), config, datetime.now(timezone.utc)))
+    def challenge_info() -> dict | None:
+        # Chỉ lấy ID và ngưỡng; không đưa query của challenge lên dashboard
+        if not DEFAULT_CHALLENGE.exists():
+            return None
+        try:
+            challenge = load_challenge(DEFAULT_CHALLENGE)
+        except ValueError:
+            return None
+        return {
+            "challenge_id": challenge.challenge_id,
+            "latency_threshold_ms": challenge.latency_threshold_ms,
+        }
+
+    def page(minutes: int | None = None) -> str:
+        data = build_dashboard(
+            load_records(args.logs), config, datetime.now(timezone.utc), minutes, challenge_info()
+        )
+        return render_html(data)
 
     if args.snapshot:
-        args.snapshot.write_text(page(), encoding="utf-8")
+        args.snapshot.write_text(page(args.minutes), encoding="utf-8")
         print(f"Đã ghi {args.snapshot}")
         return
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - tên method do http.server quy định
-            if self.path.split("?")[0] not in ("/", "/index.html"):
+            path, _, query = self.path.partition("?")
+            if path not in ("/", "/index.html"):
                 self.send_error(404)
                 return
-            body = page().encode("utf-8")
+            minutes = parse_qs(query).get("minutes", [None])[0]
+            minutes = int(minutes) if minutes and minutes.isdigit() else None
+            if minutes is not None and not 1 <= minutes <= contract_minutes:
+                minutes = None
+            body = page(minutes).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
